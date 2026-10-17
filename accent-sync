@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Sincroniza o accent do GNOME com o Zed e o Ghostty.
+
+Le o accent em org.gnome.desktop.interface e regrava apenas as chaves de
+accent do tema do Zed e a chave `background` dos temas do Ghostty. Nao depende
+de nenhuma extensao do GNOME Shell.
+
+O tint e sempre recalculado a partir de bases neutras fixas, nunca do valor
+ja gravado, entao o script e idempotente: rodar mil vezes da o mesmo resultado
+e trocar de cor nao acumula tom.
+
+Uso:
+  accent-sync            regrava os arquivos
+  accent-sync --dry-run  so mostra o que mudaria
+"""
+
+import hashlib
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+HOME = pathlib.Path.home()
+ZED_THEME = HOME / ".config/zed/themes/zedwaita.json"
+GHOSTTY_THEME_DIR = HOME / ".config/ghostty/themes"
+
+# Accents do GNOME: (accent_bg_color, variante clareada para texto em dark).
+# A primeira e a cor base, a que o Nautilus e os demais apps GTK usam; a
+# segunda e o que o libadwaita usa para texto sobre fundo escuro.
+ACCENTS = {
+    "blue": ("#3584e4", "#81d0ff"),
+    "teal": ("#2190a4", "#7bdff4"),
+    "green": ("#3a944a", "#8de698"),
+    "yellow": ("#c88800", "#ffc057"),
+    "orange": ("#ed5b00", "#ff9c5b"),
+    "red": ("#e62d42", "#ff888c"),
+    "pink": ("#d56199", "#ffa0d8"),
+    "purple": ("#9141ac", "#fba7ff"),
+    "slate": ("#6f8396", "#bbd1e5"),
+}
+
+# --- Zed: chaves de accent puro -------------------------------------------------
+ZED_PLAIN = [
+    "text.accent", "icon.accent", "link_text.hover",
+    "border.focused", "border.selected",
+    "pane.focused_border", "panel.focused_border",
+    "info", "renamed",
+]
+
+# --- Zed: chaves de accent com alpha fixo --------------------------------------
+ZED_ALPHA = {
+    "info.background": "1a", "info.border": "15",
+    "renamed.background": "1a", "renamed.border": "15",
+    "hint.border": "15",
+    "drop_target.background": "80",
+    "search.match_background": "40",
+    "version_control.conflict_marker.theirs": "1a",
+    "editor.document_highlight.read_background": "15",
+}
+
+# --- Zed: estados de selecao ---------------------------------------------------
+# Usa o accent BASE (como o Nautilus), nao a variante de texto: com a variante
+# de texto a selecao fica num cinza-arroxeado sem relacao com o resto do
+# desktop. 35% no active, 22% no selected (para manter hierarquia).
+ZED_SELECTION = {
+    "element.active": "59", "element.selected": "38",
+    "ghost_element.active": "59", "ghost_element.selected": "38",
+}
+
+# --- Zed: superficies, sem tint -----------------------------------------------
+# Bases medidas no Nautilus com o CSS real do sistema (accent slate, sem
+# ChromaLeon): sidebar #2e2e32, area de conteudo #1d1d20, chrome #222226.
+# Sao exatamente as cores que a paleta Adwaita define (sidebar_bg_color,
+# view_bg_color e window_bg_color), entao o Zed fica com o mesmo tom dos apps
+# GTK4 do sistema em vez de mais claro.
+#
+# Sem tint de proposito: o adw-gtk3-colorizer mexe so no accent, e um tint de
+# accent sobre surface escura clareia tudo, deixando o Zed ~5 pontos acima dos
+# demais apps.
+ZED_SURFACES = {
+    # chrome / fundo da janela
+    "background": ("#222226", "#fafafa"),
+    "tab_bar.background": ("#222226", "#fafafa"),
+    "tab.inactive_background": ("#222226", "#fafafa"),
+    "title_bar.background": ("#222226", "#ffffff"),
+    "title_bar.inactive_background": ("#222226", "#ebebeb"),
+    "terminal.background": ("#222226", "#fcfcfc"),
+    # meio nivel: sidebar, paineis e superficies elevadas
+    "surface.background": ("#2e2e32", "#ffffff"),
+    "elevated_surface.background": ("#2e2e32", "#ffffff"),
+    "panel.background": ("#2e2e32", "#ebebeb"),
+    "toolbar.background": ("#2e2e32", "#ffffff"),
+    "status_bar.background": ("#2e2e32", "#ebebeb"),
+    "tab.active_background": ("#2e2e32", "#ffffff"),
+    "editor.subheader.background": ("#2e2e32", "#ebebeb"),
+    "editor.active_line.background": ("#2e2e32", "#f6f5f4"),
+    # nivel mais escuro: o editor
+    "editor.background": ("#1d1d20", "#fcfcfc"),
+    "editor.gutter.background": ("#1d1d20", "#fcfcfc"),
+}
+
+# --- Ghostty: base do background e intensidade do tint -------------------------
+GHOSTTY_BACKGROUND = {
+    "dark": ("#1d1d20", 0.05),
+    "light": ("#ffffff", 0.07),
+}
+
+# Cursor e selecao de texto ficam neutros de proposito (como no Zed): o accent
+# nao deve colorir o conteudo do usuario.
+
+
+def gsettings(key):
+    """Le uma chave do dconf e devolve o valor sem aspas."""
+    try:
+        out = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", key],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    if len(out) >= 2 and out[0] == out[-1] == "'":
+        return out[1:-1]
+    return out
+
+
+def mix_hex(base, accent, ratio):
+    """Mistura `accent` sobre `base` na proporcao `ratio` (0-1)."""
+    def parse(value):
+        h = value.lstrip("#")
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        if len(h) > 6:
+            h = h[:6]
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", h):
+            return None
+        return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+
+    b, a = parse(base), parse(accent)
+    if b is None or a is None:
+        return base
+    return "#" + "".join(
+        f"{round(bi + (ai - bi) * ratio):02x}" for bi, ai in zip(b, a)
+    )
+
+
+def resolve_accent():
+    """Devolve (base, texto) do accent atual, ou None se nao recognitionavel."""
+    name = gsettings("accent-color")
+    if name in ACCENTS:
+        return ACCENTS[name]
+    #GNOME 47+ aceita hex direto; nesse caso base e texto sao a mesma cor
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", name):
+        return name, name
+    return None
+
+
+def escape(key):
+    return key.replace(".", r"\.")
+
+
+def rewrite(content, key, alpha=None, first=None):
+    """Substitui o valor de `key` em todas as ocorrencias.
+
+    `alpha` fixa o sufixo de transparencia. `first` permite usar cores
+    diferentes na 1a ocorrencia (tema dark) e nas seguintes (tema light).
+    """
+    suffix = f"([0-9a-fA-F]{{2}})?" if alpha else ""
+    pattern = re.compile(rf'("{escape(key)}":\s*")#[0-9a-fA-F]{{6}}{suffix}"')
+    count = 0
+
+    def replace(match):
+        nonlocal count
+        count += 1
+        return f'{match.group(1)}{first(count)}{alpha or ""}"'
+
+    return pattern.sub(replace, content), count
+
+
+def sync_zed(base_hex, text_hex, dry_run=False):
+    if not ZED_THEME.exists():
+        print(f"zed: {ZED_THEME} nao existe, pulando")
+        return
+
+    content = ZED_THEME.read_text(encoding="utf-8")
+    original = content
+
+    # accent puro: dark usa a variante de texto, light usa a base
+    for key in ZED_PLAIN:
+        content, _ = rewrite(
+            content, key, first=lambda n: text_hex if n == 1 else base_hex
+        )
+    # accent com alpha: mesma regra de cor, alpha fixo
+    for key, alpha in ZED_ALPHA.items():
+        content, _ = rewrite(
+            content, key, alpha=alpha,
+            first=lambda n: text_hex if n == 1 else base_hex,
+        )
+    # (as chaves acima usam a variante de texto no tema dark, porque ali o
+    # accent precisa de contraste sobre fundo escuro)
+    # estados de selecao: sempre o accent base
+    for key, alpha in ZED_SELECTION.items():
+        content, _ = rewrite(
+            content, key, alpha=alpha, first=lambda n: base_hex
+        )
+    # superficies: base pura, sem tint (para casar com os apps GTK4 do sistema)
+    for key, (dark_base, light_base) in ZED_SURFACES.items():
+        pattern = re.compile(rf'("{escape(key)}":\s*")#[0-9a-fA-F]{{6}}([0-9a-fA-F]{{2}})?"')
+        counter = 0
+
+        def surface(match, _dark=dark_base, _light=light_base):
+            nonlocal counter
+            counter += 1
+            return f'{match.group(1)}{_dark if counter == 1 else _light}"'
+
+        content = pattern.sub(surface, content)
+
+    if content == original:
+        print("zed: ja estava em dia")
+        return
+    if dry_run:
+        print("zed: (dry-run) mudaria")
+        return
+    ZED_THEME.write_text(content, encoding="utf-8")
+    print(f"zed: tema atualizado (accent base {base_hex}, texto {text_hex})")
+
+
+def sync_ghostty(base_hex, dry_run=False):
+    for appearance, (bg_base, ratio) in GHOSTTY_BACKGROUND.items():
+        path = GHOSTTY_THEME_DIR / f"accent-sync-{appearance}"
+        if not path.exists():
+            print(f"ghostty: {path} nao existe, pulando")
+            continue
+        content = path.read_text(encoding="utf-8")
+        tinted = mix_hex(bg_base, base_hex, ratio)
+        updated = re.sub(
+            r"^background = #[0-9a-fA-F]{6}$",
+            f"background = {tinted}",
+            content,
+            flags=re.MULTILINE,
+        )
+        if updated == content:
+            print(f"ghostty/{appearance}: ja estava em dia")
+            continue
+        if dry_run:
+            print(f"ghostty/{appearance}: (dry-run) mudaria")
+            continue
+        path.write_text(updated, encoding="utf-8")
+        print(f"ghostty/{appearance}: background -> {tinted}")
+
+
+def sync_flatpak_themes():
+    """Copia os temas GTK3 do sistema para ~/.local/share/themes.
+
+    Apps Flatpak nao enxergam /usr/share/themes (o Flatpak monta o host em
+    /run/host, fora do XDG_DATA_DIRS do app) e um symlink tambem nao resolve,
+    porque o alvo fica fora do sandbox. A unica via que funciona e ter uma copia
+    real dentro de um diretorio concedido.
+
+    Recopia so quando a assinatura do tema de origem muda, ou seja, quando o
+    pacote do sistema e atualizado.
+    """
+    src_root = pathlib.Path("/usr/share/themes")
+    dst_root = HOME / ".local/share/themes"
+    stamp_file = HOME / ".cache/accent-sync/themes.stamp"
+    themes = ("adw-gtk3", "adw-gtk3-dark")
+
+    signatures = {}
+    for name in themes:
+        source = src_root / name
+        if not source.is_dir():
+            print(f"flatpak: {source} ausente, pulando")
+            return
+        digest = hashlib.sha256()
+        for item in sorted(source.rglob("*")):
+            if item.is_file():
+                digest.update(str(item.relative_to(source)).encode())
+                digest.update(str(item.stat().st_size).encode())
+        signatures[name] = digest.hexdigest()
+
+    previous = {}
+    if stamp_file.exists():
+        for line in stamp_file.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                previous[key] = value
+
+    if previous == signatures:
+        return
+
+    for name in themes:
+        destination = dst_root / name
+        temporary = dst_root / f".{name}.tmp"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        shutil.copytree(src_root / name, temporary)
+        if destination.exists():
+            shutil.rmtree(destination)
+        temporary.rename(destination)
+
+    stamp_file.parent.mkdir(parents=True, exist_ok=True)
+    stamp_file.write_text(
+        "".join(f"{k}={v}\n" for k, v in sorted(signatures.items())),
+        encoding="utf-8",
+    )
+    print("flatpak: temas GTK3 copiados para ~/.local/share/themes")
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    accent = resolve_accent()
+    if accent is None:
+        name = gsettings("accent-color") or "?"
+        print(f"accent '{name}' nao reconhecido; nada alterado", file=sys.stderr)
+        return 1
+    base_hex, text_hex = accent
+    if dry_run:
+        print(f"-- dry-run: accent base {base_hex}, texto {text_hex} --")
+    sync_zed(base_hex, text_hex, dry_run)
+    sync_ghostty(base_hex, dry_run)
+    if not dry_run:
+        sync_flatpak_themes()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
