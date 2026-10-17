@@ -1,0 +1,10 @@
+[Unit]
+Description=Dispara o accent-sync quando o accent do sistema muda
+
+[Path]
+# o dconf reescreve o banco a cada mudança de setting, então o mtime muda
+PathChanged=%h/.config/dconf/user
+Unit=accent-sync.service
+
+[Install]
+WantedBy=default.target

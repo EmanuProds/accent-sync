@@ -1,0 +1,13 @@
+[Unit]
+Description=Sincroniza o accent do GNOME com o Zed e o Ghostty
+Documentation=file:%h/.local/bin/accent-sync
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/accent-sync
+# não bloqueia a sessão se o gsettings estiver demorando
+TimeoutStartSec=20
+
+[Install]
+# roda uma vez no login; o accent-sync.path cuida das mudanças seguintes
+WantedBy=default.target
