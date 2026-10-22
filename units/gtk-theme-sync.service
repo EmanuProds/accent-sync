@@ -1,14 +1,14 @@
 [Unit]
 Description=Sincroniza o accent e o tema GTK do GNOME com Zed, Ghostty e Flatpak
-Documentation=file:%h/.local/bin/accent-sync
+Documentation=file:%h/.local/bin/gtk-theme-sync
 After=graphical-session.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/accent-sync
+ExecStart=%h/.local/bin/gtk-theme-sync
 # não bloqueia a sessão se o gsettings estiver demorando
 TimeoutStartSec=20
 
 [Install]
-# roda uma vez no login; o accent-sync.path cuida das mudanças seguintes
+# roda uma vez no login; o gtk-theme-sync.path cuida das mudanças seguintes
 WantedBy=graphical-session.target

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Sincroniza o accent do GNOME com o Zed e o Ghostty.
+"""Sincroniza o tema GTK e o accent do GNOME com Zed, Ghostty e Flatpak.
 
-Le o accent em org.gnome.desktop.interface e regrava apenas as chaves de
-accent do tema do Zed e a chave `background` dos temas do Ghostty. Nao depende
-de nenhuma extensao do GNOME Shell.
+Le o color-scheme e accent-color em org.gnome.desktop.interface e:
+- regrava as chaves de accent do tema do Zed (zedwaita.json)
+- regrava a chave `background` dos temas do Ghostty
+- define gtk-theme (adw-gtk3/adw-gtk3-dark) e settings.ini GTK3/4
+- copia temas GTK3 para ~/.local/share/themes (Flatpak)
 
 O tint e sempre recalculado a partir de bases neutras fixas, nunca do valor
 ja gravado, entao o script e idempotente: rodar mil vezes da o mesmo resultado
 e trocar de cor nao acumula tom.
 
 Uso:
-  accent-sync            regrava os arquivos
-  accent-sync --dry-run  so mostra o que mudaria
+  gtk-theme-sync            regrava os arquivos
+  gtk-theme-sync --dry-run  so mostra o que mudaria
 """
 
 import hashlib
@@ -228,7 +230,7 @@ def sync_zed(base_hex, text_hex, dry_run=False):
 
 def sync_ghostty(base_hex, dry_run=False):
     for appearance, (bg_base, ratio) in GHOSTTY_BACKGROUND.items():
-        path = GHOSTTY_THEME_DIR / f"accent-sync-{appearance}"
+        path = GHOSTTY_THEME_DIR / f"gtk-theme-sync-{appearance}"
         if not path.exists():
             print(f"ghostty: {path} nao existe, pulando")
             continue
@@ -263,7 +265,7 @@ def sync_flatpak_themes():
     """
     src_root = pathlib.Path("/usr/share/themes")
     dst_root = HOME / ".local/share/themes"
-    stamp_file = HOME / ".cache/accent-sync/themes.stamp"
+    stamp_file = HOME / ".cache/gtk-theme-sync/themes.stamp"
     themes = ("adw-gtk3", "adw-gtk3-dark")
 
     signatures = {}
@@ -382,7 +384,7 @@ def sync_gtk_theme(dry_run=False):
 
     O GNOME 50 nao tem mais Adwaita-dark em /usr/share/themes, entao um
     gtk-theme 'Adwaita-dark' (valor antigo) cai em HighContrast. Aqui forçamos
-    o par adw-gtk3/adw-gtk3-dark, que e o que o accent-sync copia para Flatpak,
+    o par adw-gtk3/adw-gtk3-dark, que e o que o gtk-theme-sync copia para Flatpak,
     e mantemos o settings.ini dos apps GTK3/GTK4 em dia (bug do GNOME 50 em
     que GTK4 ignora prefer-dark via gsettings).
     """
