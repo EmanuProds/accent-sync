@@ -307,6 +307,124 @@ def sync_flatpak_themes():
     print("flatpak: temas GTK3 copiados para ~/.local/share/themes")
 
 
+def gsettings_set(key, value):
+    """Grava uma chave do dconf; devolve True em sucesso."""
+    try:
+        subprocess.run(
+            ["gsettings", "set", "org.gnome.desktop.interface", key, value],
+            check=True, timeout=5,
+        )
+        return True
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"gsettings: falha ao gravar {key}: {exc}", file=sys.stderr)
+        return False
+
+
+def gtk_theme_for_scheme(scheme):
+    """Mapeia color-scheme do GNOME para o tema GTK3 legado correspondente."""
+    return "adw-gtk3-dark" if "dark" in (scheme or "") else "adw-gtk3"
+
+
+def update_settings_ini(path, theme, prefer_dark):
+    """Garante gtk-theme-name e gtk-application-prefer-dark-theme no settings.ini."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    if path.exists():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    # localiza ou cria a secao [Settings]
+    section_index = None
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "[settings]":
+            section_index = i
+            break
+    if section_index is None:
+        if lines and lines[-1].strip() != "":
+            lines.append("")
+        lines.append("[Settings]")
+        section_index = len(lines) - 1
+
+    # coleta chaves existentes na secao (ate a proxima secao ou fim)
+    end = len(lines)
+    for j in range(section_index + 1, len(lines)):
+        if lines[j].lstrip().startswith("[") and lines[j].rstrip().endswith("]"):
+            end = j
+            break
+
+    wanted = {
+        "gtk-theme-name": theme,
+        "gtk-application-prefer-dark-theme": "1" if prefer_dark else "0",
+    }
+    present = set()
+    for j in range(section_index + 1, end):
+        if "=" in lines[j]:
+            key = lines[j].split("=", 1)[0].strip()
+            if key in wanted:
+                lines[j] = f"{key} = {wanted[key]}"
+                present.add(key)
+
+    # insere as que faltam logo apos o cabecalho da secao
+    insert_at = section_index + 1
+    for key in ("gtk-theme-name", "gtk-application-prefer-dark-theme"):
+        if key not in present:
+            lines.insert(insert_at, f"{key} = {wanted[key]}")
+            insert_at += 1
+            end += 1
+
+    new_content = "\n".join(lines) + "\n"
+    if path.exists() and path.read_text(encoding="utf-8") == new_content:
+        return False
+    path.write_text(new_content, encoding="utf-8")
+    return True
+
+
+def sync_gtk_theme(dry_run=False):
+    """Sincroniza gtk-theme (apps legados) com o color-scheme do GNOME.
+
+    O GNOME 50 nao tem mais Adwaita-dark em /usr/share/themes, entao um
+    gtk-theme 'Adwaita-dark' (valor antigo) cai em HighContrast. Aqui forçamos
+    o par adw-gtk3/adw-gtk3-dark, que e o que o accent-sync copia para Flatpak,
+    e mantemos o settings.ini dos apps GTK3/GTK4 em dia (bug do GNOME 50 em
+    que GTK4 ignora prefer-dark via gsettings).
+    """
+    scheme = gsettings("color-scheme")
+    target = gtk_theme_for_scheme(scheme)
+    dark = "dark" in (scheme or "")
+    current = gsettings("gtk-theme")
+
+    changed = False
+    if current != target:
+        if dry_run:
+            print(f"gtk-theme: (dry-run) {current!r} -> {target!r}")
+        else:
+            if gsettings_set("gtk-theme", target):
+                print(f"gtk-theme: {current!r} -> {target!r}")
+                changed = True
+            else:
+                print(f"gtk-theme: nao foi possivel gravar (atual {current!r})")
+    else:
+        print(f"gtk-theme: ja estava em {target!r}")
+
+    for path in (HOME / ".config/gtk-3.0/settings.ini",
+                 HOME / ".config/gtk-4.0/settings.ini"):
+        if dry_run:
+            desired = f"[Settings]\ngtk-theme-name = {target}\ngtk-application-prefer-dark-theme = {'1' if dark else '0'}\n"
+            try:
+                current_content = path.read_text(encoding="utf-8") if path.exists() else ""
+            except OSError:
+                current_content = ""
+            if current_content == desired:
+                print(f"settings.ini: {path} ja estava em dia")
+            else:
+                print(f"settings.ini: (dry-run) atualizaria {path}")
+            continue
+        if update_settings_ini(path, target, dark):
+            print(f"settings.ini: {path} atualizado")
+            changed = True
+        else:
+            print(f"settings.ini: {path} ja estava em dia")
+    return changed
+
+
 def main():
     dry_run = "--dry-run" in sys.argv
     accent = resolve_accent()
@@ -319,6 +437,7 @@ def main():
         print(f"-- dry-run: accent base {base_hex}, texto {text_hex} --")
     sync_zed(base_hex, text_hex, dry_run)
     sync_ghostty(base_hex, dry_run)
+    sync_gtk_theme(dry_run)
     if not dry_run:
         sync_flatpak_themes()
     return 0
